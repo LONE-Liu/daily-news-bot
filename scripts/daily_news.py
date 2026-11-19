@@ -37,7 +37,7 @@ FEEDS = {
     ],
     "科技": [
         "https://www.ithome.com/rss/",
-        "https://36kr.com/feed",
+        "https://sspai.com/feed",
     ],
     "社会": [
         "https://www.chinanews.com.cn/rss/society.xml",
@@ -46,7 +46,7 @@ FEEDS = {
 
 MAX_AGE_HOURS = 36      # 超过这个时间的条目丢弃
 MAX_ITEMS = 8           # 总条数上限（按栏目均摊）
-PER_CATEGORY_MAX = max(1, MAX_ITEMS // 4)   # 单个栏目最多几条
+PER_CATEGORY_MAX = max(1, -(-MAX_ITEMS // len(FEEDS)))   # 单栏上限=总量按栏目数向上取整
 TITLE_MAX = 46          # 标题截断长度
 SUMMARY_MAX = 72        # 摘要截断长度
 UA = "Mozilla/5.0 (compatible; daily-news-bot/1.0)"
@@ -56,6 +56,9 @@ NOISE = (
     "喜加一", "免费领取", "限时免费", "优惠券", "打折", "促销", "秒杀",
     "开奖", "中奖", "彩票", "招聘启事", "声明", "更正", "讣告",
 )
+
+# 关注点加权：标题命中这些关键词的条目优先入选
+FOCUS = ("BIM", "建筑", "工程", "EPC", "房地产", "人力资源")
 
 TAG_RE = re.compile(r"<[^>]+>")
 WS_RE = re.compile(r"\s+")
@@ -192,6 +195,8 @@ def collect():
             # 新的在前
             dated = [(t, s, l, normalize_dt(d)) for (t, s, l, d) in entries]
             dated.sort(key=lambda x: x[3] or dt.datetime.min, reverse=True)
+            dated = ([x for x in dated if any(k in x[0] for k in FOCUS)]
+                     + [x for x in dated if not any(k in x[0] for k in FOCUS)])
 
             for title, summary, link, when in dated:
                 if len(picked) >= PER_CATEGORY_MAX:
@@ -215,6 +220,17 @@ def collect():
                 )
         if picked:
             result[category] = picked
+
+    # 全局兜底：超量时从末尾栏目往回砍，保证总数不超 MAX_ITEMS
+    total = sum(len(v) for v in result.values())
+    for cat in reversed(list(result)):
+        while total > MAX_ITEMS and result[cat]:
+            result[cat].pop()
+            total -= 1
+        if not result[cat]:
+            del result[cat]
+        if total <= MAX_ITEMS:
+            break
 
     return result, errors
 
