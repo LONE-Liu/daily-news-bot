@@ -2,7 +2,7 @@
 """每日简报：世界头条 + 外媒看中国 + 国内要闻，中文呈现 + AI 语音朗读。
 
 流程（GitHub Actions）:
-    抓 RSS → DeepSeek 翻译英文条目 → 生成中文 Markdown
+    抓 RSS → DeepSeek 翻译+一句话概述 → 生成中文 Markdown
     → edge-tts 合成语音 mp3 + 播放页 → 推送到个人微信（Server酱）
 
 用法:
@@ -74,7 +74,6 @@ FEEDS = [
 
 MAX_ITEMS = 30
 MAX_AGE_HOURS = 36
-TITLE_MAX = 60
 SUMMARY_MAX = 80
 UA = "Mozilla/5.0 (compatible; daily-news-bot/3.0)"
 VOICE = "zh-CN-XiaoxiaoNeural"
@@ -102,6 +101,7 @@ def clean(text):
 
 
 def clip(text, limit):
+    """截断到 limit；优先句末收口，其次词边界，一律不加省略号。"""
     text = (text or "").strip()
     if len(text) <= limit:
         return text
@@ -110,7 +110,10 @@ def clip(text, limit):
         idx = head.rfind(sep)
         if idx >= limit // 2:
             return head[: idx + len(sep)].strip()
-    return head.rstrip("，、,;；:： ") + "…"
+    idx = max(head.rfind(" "), head.rfind("，"), head.rfind("、"), head.rfind(","))
+    if idx > limit // 2:
+        return head[:idx].rstrip()
+    return head.rstrip()
 
 
 def norm_key(title):
@@ -217,7 +220,8 @@ def collect():
                 taken += 1
                 picked.append({
                     "source": label,
-                    "title": clip(title, TITLE_MAX),
+                    "title": title,
+                    "desc": summary,
                     "summary": clip(summary, SUMMARY_MAX),
                     "link": link,
                 })
@@ -235,20 +239,22 @@ def collect():
     return result, errors
 
 
-def translate(groups, key):
-    """把英文条目翻译成简体中文，原地替换。失败则保留原文。"""
+def process(groups, key):
+    """用 DeepSeek 统一处理所有条目：完整中文标题 + 一句话中心概述。失败则保留原文。"""
     flat = []
     for g in groups:
         for it in g["items"]:
-            if not is_cjk(it["title"]):
-                flat.append(it)
+            flat.append(it)
     if not flat or not key:
-        return 0, 0, None  # 无需翻译
+        return 0, 0, None
 
-    payload = [{"title": it["title"], "summary": it["summary"]} for it in flat]
+    payload = [{"title": it["title"], "desc": it.get("desc") or ""} for it in flat]
     prompt = (
-        "把下面 JSON 数组里每个对象的 title 和 summary 翻译成简体中文，"
-        "保留 JSON 结构，只输出 JSON，不要任何解释或额外文字：\n"
+        "你是一名新闻编辑。下面是 JSON 数组，每个对象是一条新闻的 {title, desc}。\n"
+        "对每条输出 {title, summary}：\n"
+        "1) title 用完整简体中文标题：英文标题译成简体中文并保留完整意思；中文标题保留原文。\n"
+        "2) summary 用一句话简体中文概述该新闻的中心意思，表达清楚、不空洞，60 字以内。\n"
+        "只输出 JSON 数组，不要任何解释或额外文字：\n"
         + json.dumps(payload, ensure_ascii=False)
     )
     body = json.dumps({
@@ -261,19 +267,25 @@ def translate(groups, key):
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", "Bearer " + key)
     try:
-        with urllib.request.urlopen(req, timeout=90) as r:
+        with urllib.request.urlopen(req, timeout=120) as r:
             data = json.loads(r.read().decode("utf-8", "ignore"))
         content = data["choices"][0]["message"]["content"].strip()
         content = re.sub(r"^```(json)?\s*|\s*```$", "", content).strip()
         translated = json.loads(content)
         for it, tr in zip(flat, translated):
             if tr.get("title"):
-                it["title"] = clip(clean(tr["title"]), TITLE_MAX)
+                it["title"] = clean(tr["title"])
             if tr.get("summary"):
-                it["summary"] = clip(clean(tr["summary"]), SUMMARY_MAX)
+                it["summary"] = clean(tr["summary"])
         return len(flat), len(translated), None
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "ignore")[:300]
+        except Exception:
+            detail = ""
+        return len(flat), 0, "处理失败(HTTP %s): %s" % (e.code, detail)
     except Exception as e:
-        return len(flat), 0, "翻译失败，保留原文: %s" % type(e).__name__
+        return len(flat), 0, "处理失败: %s: %s" % (type(e).__name__, e)
 
 
 def build_markdown(groups, today, with_voice=True):
@@ -398,13 +410,13 @@ def main():
     # 翻译
     key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if key:
-        n_src, n_done, err = translate(groups, key)
+        n_src, n_done, err = process(groups, key)
         if err:
             print("[warn] %s" % err, file=sys.stderr)
         else:
-            print("[info] 翻译 %d 条" % n_done, file=sys.stderr)
+            print("[info] 翻译并概述 %d 条" % n_done, file=sys.stderr)
     else:
-        print("[warn] 未设置 DEEPSEEK_API_KEY，跳过翻译，英文标题保留", file=sys.stderr)
+        print("[warn] 未设置 DEEPSEEK_API_KEY，跳过处理，保留原文标题与摘要", file=sys.stderr)
 
     markdown = build_markdown(groups, today, with_voice=bool(args.site))
     print(markdown)
