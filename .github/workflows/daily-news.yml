@@ -2,12 +2,18 @@ name: daily-news
 
 on:
   schedule:
-    # 04:00 UTC = 12:00 北京时间。GitHub 的 cron 在高峰期可能延迟几分钟到半小时。
+    # 04:00 UTC = 12:00 北京时间
     - cron: "0 4 * * *"
   workflow_dispatch: {}
 
 permissions:
   contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
 
 jobs:
   push:
@@ -19,10 +25,27 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Fetch feeds and push to WeChat
+      - name: Install edge-tts
+        run: pip install --quiet edge-tts
+
+      - name: Fetch + translate + build voice
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python scripts/daily_news.py --out brief.md --site site
+
+      - name: Upload page
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy page
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Push to WeChat
         env:
           SCT_KEY: ${{ secrets.SCT_KEY }}
-        run: python scripts/daily_news.py --out brief.md
+        run: python scripts/daily_news.py --send brief.md
 
       - name: Upload brief as artifact
         if: always()
