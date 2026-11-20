@@ -27,6 +27,8 @@ jobs:
       - name: Fetch + translate + build voice
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          JSONBIN_KEY: ${{ secrets.JSONBIN_KEY }}
+          JSONBIN_BIN_ID: ${{ secrets.JSONBIN_BIN_ID }}
         run: python scripts/daily_news.py --out brief.md --site site
 
       - name: Upload page
