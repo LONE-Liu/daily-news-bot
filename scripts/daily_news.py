@@ -245,7 +245,7 @@ def fetch_article(url, timeout=12):
     return WS_RE.sub(" ", text).strip()
 
 
-def extract_main(text, limit=2500):
+def extract_main(text, limit=1200):
     """挑出正文主体段落（跳过导航短文本），截断到 limit 字符。"""
     paras = [pp.strip() for pp in (text or "").split("\n")]
     paras = [pp for pp in paras if len(pp) > 25]
@@ -264,7 +264,7 @@ def get_body(it):
 
 
 def process(groups, key):
-    """抓原文 → DeepSeek 完整中文标题 + 150 字完整概述。失败保留原文。"""
+    """抓原文 → DeepSeek 分批翻译+概述+关键词。失败保留原文，不中断。"""
     flat = []
     for g in groups:
         for it in g["items"]:
@@ -276,47 +276,63 @@ def process(groups, key):
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         bodies = list(ex.map(get_body, flat))
 
-    payload = [{"title": it["title"], "body": bodies[i]} for i, it in enumerate(flat)]
-    prompt = (
-        "你是一名资深新闻编辑。下面是 JSON 数组，每个对象是一条新闻的 {title, body}。\n"
-        "对每条输出 {title, summary}：\n"
-        "1) title 用完整简体中文标题：英文标题译成简体中文并保留完整意思；中文标题保留原文。\n"
-        "2) summary 用简体中文写一段 150 字左右的完整概述，覆盖文章的核心事实、关键人物/数字与结论，信息具体、不空洞、不重复标题。\n"
-        "3) keywords 用 2-3 个简体中文关键词概括本条主题（字符串数组）。\n"
-        "只输出 JSON 数组，不要任何解释或额外文字：\n"
-        + json.dumps(payload, ensure_ascii=False)
-    )
-    body = json.dumps({
-        "model": "deepseek-chat",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "stream": False,
-    }).encode("utf-8")
-    req = urllib.request.Request(DEEPSEEK_URL, data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Authorization", "Bearer " + key)
-    try:
-        with urllib.request.urlopen(req, timeout=180) as r:
-            data = json.loads(r.read().decode("utf-8", "ignore"))
-        content = data["choices"][0]["message"]["content"].strip()
-        content = re.sub(r"^```(json)?\s*|\s*```$", "", content).strip()
-        translated = json.loads(content)
-        for it, tr in zip(flat, translated):
-            if tr.get("title"):
-                it["title"] = clean(tr["title"])
-            if tr.get("summary"):
-                it["summary"] = clean(tr["summary"])
-            if tr.get("keywords"):
-                it["keywords"] = [clean(k) for k in tr["keywords"] if clean(k)]
-        return len(flat), len(translated), None
-    except urllib.error.HTTPError as e:
+    done = 0
+    failed_batches = 0
+    last_err = None
+    BATCH = 6
+
+    for start in range(0, len(flat), BATCH):
+        chunk = flat[start:start + BATCH]
+        chunk_bodies = bodies[start:start + BATCH]
+        payload = [{"title": it["title"], "body": chunk_bodies[i]} for i, it in enumerate(chunk)]
+        prompt = (
+            "你是资深新闻编辑。下面是 JSON 数组，每个对象是一条新闻的 {title, body}。\n"
+            "对每条严格输出 {title, summary, keywords}：\n"
+            "1) title 完整简体中文标题，英文译成简体中文并保留完整意思，中文保留原文。\n"
+            "2) summary 一段 150 字左右的简体中文概述，覆盖核心事实、关键人物/数字与结论，信息具体不空洞。\n"
+            "3) keywords 2-3 个简体中文关键词（字符串数组）。\n"
+            "只输出 JSON 数组，不要任何解释、不要 markdown 代码块：\n"
+            + json.dumps(payload, ensure_ascii=False)
+        )
+        body = json.dumps({
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "stream": False,
+        }).encode("utf-8")
+        req = urllib.request.Request(DEEPSEEK_URL, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", "Bearer " + key)
         try:
-            detail = e.read().decode("utf-8", "ignore")[:300]
-        except Exception:
-            detail = ""
-        return len(flat), 0, "处理失败(HTTP %s): %s" % (e.code, detail)
-    except Exception as e:
-        return len(flat), 0, "处理失败: %s: %s" % (type(e).__name__, e)
+            with urllib.request.urlopen(req, timeout=120) as r:
+                data = json.loads(r.read().decode("utf-8", "ignore"))
+            content = data["choices"][0]["message"]["content"].strip()
+            content = re.sub(r"^```(json)?\s*|\s*```$", "", content).strip()
+            translated = json.loads(content)
+            for it, tr in zip(chunk, translated):
+                if tr.get("title"):
+                    it["title"] = clean(tr["title"])
+                if tr.get("summary"):
+                    it["summary"] = clean(tr["summary"])
+                if tr.get("keywords"):
+                    it["keywords"] = [clean(k) for k in tr["keywords"] if clean(k)]
+            done += len(translated)
+        except urllib.error.HTTPError as e:
+            failed_batches += 1
+            try:
+                detail = e.read().decode("utf-8", "ignore")[:200]
+            except Exception:
+                detail = ""
+            last_err = "第%d批失败(HTTP %s): %s" % (start // BATCH + 1, e.code, detail)
+            print("[warn] %s" % last_err, file=sys.stderr)
+        except Exception as e:
+            failed_batches += 1
+            last_err = "第%d批失败: %s: %s" % (start // BATCH + 1, type(e).__name__, e)
+            print("[warn] %s" % last_err, file=sys.stderr)
+
+    if failed_batches:
+        return len(flat), done, "%d/%d 批失败，已保留该批原文" % (failed_batches, (len(flat) + BATCH - 1) // BATCH)
+    return len(flat), done, None
 
 
 def _norm_scores(d):
