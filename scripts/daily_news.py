@@ -510,17 +510,17 @@ async function putRecord(rec){
   });
   if(!r.ok) throw new Error("写入失败 "+r.status);
 }
-async function vote(el, dir){
+async function vote(el, key, btnClass){
   if(!BIN.key || !BIN.id){ alert("打分存储未配置，请先设置 JSONBin"); return; }
   var kws; try { kws = JSON.parse(el.dataset.kws); } catch(e){ kws = []; }
   if(!kws.length){ alert("本条无关键词，无法打分"); return; }
-  var btn = el.querySelector("."+dir);
+  var btn = el.querySelector("."+btnClass);
   var old = btn.textContent;
   btn.disabled = true; btn.textContent = "…";
   try {
     var rec = await getRecord();
-    rec[dir] = rec[dir] || {};
-    for(var i=0;i<kws.length;i++){ rec[dir][kws[i]] = (rec[dir][kws[i]]||0) + 1; }
+    rec[key] = rec[key] || {};
+    for(var i=0;i<kws.length;i++){ rec[key][kws[i]] = (rec[key][kws[i]]||0) + 1; }
     await putRecord(rec);
     btn.textContent = old + " ✓";
   } catch(e){
@@ -529,8 +529,8 @@ async function vote(el, dir){
   }
 }
 document.querySelectorAll(".item").forEach(function(item){
-  item.querySelector(".up").addEventListener("click", function(){ vote(item,"up"); });
-  item.querySelector(".down").addEventListener("click", function(){ vote(item,"down"); });
+  item.querySelector(".up").addEventListener("click", function(){ vote(item,"upvote","up"); });
+  item.querySelector(".down").addEventListener("click", function(){ vote(item,"downvote","down"); });
 });
 </script>
 </body></html>""" % {"today": today, "body": "\n".join(cards), "jk": jk, "jb": jb}
