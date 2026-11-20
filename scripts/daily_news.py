@@ -524,12 +524,31 @@ h3.src{font-size:13px;color:#999;margin:14px 0 4px}
 .btns button{border:1px solid #ddd;background:#fff;border-radius:16px;padding:5px 14px;font-size:13px;margin-right:8px;cursor:pointer}
 .btns button:active{background:#f0f0f0}
 .audio{position:sticky;top:0;background:#fafafa;padding:8px 0;border-bottom:1px solid #eee}
+.speed{margin-top:6px;font-size:12px;color:#666;display:flex;align-items:center;gap:6px}
+.speed button{border:1px solid #ddd;background:#fff;border-radius:12px;padding:2px 10px;font-size:12px;cursor:pointer}
+.speed button.on{background:#0a66c2;color:#fff;border-color:#0a66c2}
 </style></head><body>
-<div class="audio"><audio controls autoplay src="latest.mp3" style="width:100%%"></audio></div>
+<div class="audio">
+  <audio id="player" controls src="latest.mp3" style="width:100%%"></audio>
+  <div class="speed"><span>语速</span>
+    <button data-rate="1">1x</button>
+    <button data-rate="1.5" class="on">1.5x</button>
+    <button data-rate="2">2x</button>
+  </div>
+</div>
 <h1>每日简报 %(today)s · 可打分 · AI 语音</h1>
 <p style="font-size:13px;color:#888">点 👍 多推这类、👎 少推这类；同一关键词被 👎 3 次将不再推送。</p>
 %(body)s
 <script>
+var player = document.getElementById("player");
+player.playbackRate = 1.5;
+document.querySelectorAll(".speed button").forEach(function(b){
+  b.addEventListener("click", function(){
+    player.playbackRate = parseFloat(b.dataset.rate);
+    document.querySelectorAll(".speed button").forEach(function(x){ x.classList.remove("on"); });
+    b.classList.add("on");
+  });
+});
 var BIN = { key: "%(jk)s", id: "%(jb)s" };
 async function getRecord(){
   var r = await fetch("https://api.jsonbin.io/v3/b/"+BIN.id, {headers:{"X-Master-Key":BIN.key}});
