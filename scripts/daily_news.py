@@ -25,6 +25,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -263,6 +264,42 @@ def get_body(it):
     return it.get("desc") or ""
 
 
+def _deepseek(key, prompt, attempts=3):
+    """调用 DeepSeek，带重试；返回 (parsed_json_or_None, error_msg_or_None)。"""
+    body = json.dumps({
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "stream": False,
+    }).encode("utf-8")
+    for a in range(attempts):
+        req = urllib.request.Request(DEEPSEEK_URL, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", "Bearer " + key)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                data = json.loads(r.read().decode("utf-8", "ignore"))
+            content = data["choices"][0]["message"]["content"].strip()
+            content = re.sub(r"^```(json)?\s*|\s*```$", "", content).strip()
+            return json.loads(content), None
+        except urllib.error.HTTPError as e:
+            retryable = e.code in (429, 500, 502, 503, 504)
+            if retryable and a < attempts - 1:
+                time.sleep(2 * (a + 1))
+                continue
+            try:
+                detail = e.read().decode("utf-8", "ignore")[:200]
+            except Exception:
+                detail = ""
+            return None, "HTTP %s: %s" % (e.code, detail)
+        except Exception as e:
+            if a < attempts - 1:
+                time.sleep(2 * (a + 1))
+                continue
+            return None, "%s: %s" % (type(e).__name__, e)
+    return None, "重试后仍失败"
+
+
 def process(groups, key):
     """抓原文 → DeepSeek 分批翻译+概述+关键词。失败保留原文，不中断。"""
     flat = []
@@ -294,21 +331,12 @@ def process(groups, key):
             "只输出 JSON 数组，不要任何解释、不要 markdown 代码块：\n"
             + json.dumps(payload, ensure_ascii=False)
         )
-        body = json.dumps({
-            "model": "deepseek-chat",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
-            "stream": False,
-        }).encode("utf-8")
-        req = urllib.request.Request(DEEPSEEK_URL, data=body, method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Authorization", "Bearer " + key)
-        try:
-            with urllib.request.urlopen(req, timeout=120) as r:
-                data = json.loads(r.read().decode("utf-8", "ignore"))
-            content = data["choices"][0]["message"]["content"].strip()
-            content = re.sub(r"^```(json)?\s*|\s*```$", "", content).strip()
-            translated = json.loads(content)
+        translated, err = _deepseek(key, prompt)
+        if translated is None:
+            failed_batches += 1
+            last_err = "第%d批失败: %s" % (start // BATCH + 1, err)
+            print("[warn] %s" % last_err, file=sys.stderr)
+        else:
             for it, tr in zip(chunk, translated):
                 if tr.get("title"):
                     it["title"] = clean(tr["title"])
@@ -317,18 +345,7 @@ def process(groups, key):
                 if tr.get("keywords"):
                     it["keywords"] = [clean(k) for k in tr["keywords"] if clean(k)]
             done += len(translated)
-        except urllib.error.HTTPError as e:
-            failed_batches += 1
-            try:
-                detail = e.read().decode("utf-8", "ignore")[:200]
-            except Exception:
-                detail = ""
-            last_err = "第%d批失败(HTTP %s): %s" % (start // BATCH + 1, e.code, detail)
-            print("[warn] %s" % last_err, file=sys.stderr)
-        except Exception as e:
-            failed_batches += 1
-            last_err = "第%d批失败: %s: %s" % (start // BATCH + 1, type(e).__name__, e)
-            print("[warn] %s" % last_err, file=sys.stderr)
+            time.sleep(1)  # 批次间间隔，避免连发限流
 
     if failed_batches:
         return len(flat), done, "%d/%d 批失败，已保留该批原文" % (failed_batches, (len(flat) + BATCH - 1) // BATCH)
