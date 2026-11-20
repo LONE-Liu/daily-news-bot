@@ -16,6 +16,7 @@
     SITE_URL             语音播放页地址，默认 https://LONE-Liu.github.io/daily-news-bot
 """
 import argparse
+import concurrent.futures
 import datetime as dt
 import html
 import json
@@ -43,36 +44,36 @@ FEEDS = [
     },
     {
         "section": "外媒看中国",
-        "limit": 5,
+        "limit": 6,
         "sources": [
-            ("DW 中文", "https://rss.dw.com/rdf/rss-chi-all", 2),
+            ("DW 中文", "https://rss.dw.com/rdf/rss-chi-all", 3),
             ("The Guardian", "https://www.theguardian.com/world/china/rss", 2),
             ("BBC 中文", "https://feeds.bbci.co.uk/zhongwen/simp/rss.xml", 1),
         ],
     },
     {
         "section": "国内 · 时政",
-        "limit": 2,
-        "sources": [("中新网", "https://www.chinanews.com.cn/rss/china.xml", 2)],
+        "limit": 3,
+        "sources": [("中新网", "https://www.chinanews.com.cn/rss/china.xml", 3)],
     },
     {
         "section": "国内 · 财经",
-        "limit": 2,
-        "sources": [("中新网", "https://www.chinanews.com.cn/rss/finance.xml", 2)],
+        "limit": 3,
+        "sources": [("中新网", "https://www.chinanews.com.cn/rss/finance.xml", 3)],
     },
     {
         "section": "国内 · 科技",
-        "limit": 2,
-        "sources": [("IT之家", "https://www.ithome.com/rss/", 2)],
+        "limit": 3,
+        "sources": [("IT之家", "https://www.ithome.com/rss/", 3)],
     },
     {
         "section": "国内 · 社会",
-        "limit": 2,
-        "sources": [("中新网", "https://www.chinanews.com.cn/rss/society.xml", 2)],
+        "limit": 3,
+        "sources": [("中新网", "https://www.chinanews.com.cn/rss/society.xml", 3)],
     },
 ]
 
-MAX_ITEMS = 30
+MAX_ITEMS = 36
 MAX_AGE_HOURS = 36
 SUMMARY_MAX = 80
 UA = "Mozilla/5.0 (compatible; daily-news-bot/3.0)"
@@ -191,8 +192,9 @@ def collect():
 
     for spec in FEEDS:
         picked = []
+        pool_cap = spec["limit"] + 6   # 多抓候选，供打分后替换
         for label, url, per_source in spec["sources"]:
-            if len(picked) >= spec["limit"]:
+            if len(picked) >= pool_cap:
                 break
             try:
                 entries = parse_feed(fetch(url))
@@ -207,7 +209,7 @@ def collect():
 
             taken = 0
             for title, summary, link, when in dated:
-                if taken >= per_source or len(picked) >= spec["limit"]:
+                if taken >= per_source + 2 or len(picked) >= pool_cap:
                     break
                 if not title or not link or is_noise(title):
                     continue
@@ -220,27 +222,49 @@ def collect():
                 taken += 1
                 picked.append({
                     "source": label,
+                    "max": per_source,
                     "title": title,
                     "desc": summary,
                     "summary": clip(summary, SUMMARY_MAX),
                     "link": link,
                 })
         if picked:
-            result.append({"section": spec["section"], "items": picked})
+            result.append({"section": spec["section"], "limit": spec["limit"], "items": picked})
 
-    total = sum(len(g["items"]) for g in result)
-    for group in reversed(result):
-        while total > MAX_ITEMS and group["items"]:
-            group["items"].pop()
-            total -= 1
-        if total <= MAX_ITEMS:
-            break
-    result = [g for g in result if g["items"]]
     return result, errors
 
 
+def fetch_article(url, timeout=12):
+    """抓取网页正文文本。"""
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    raw = urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "ignore")
+    raw = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", raw)
+    raw = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</h[1-6]>|</li>|</tr>", "\n", raw)
+    text = re.sub(r"(?s)<[^>]+>", "", raw)
+    text = html.unescape(text)
+    return WS_RE.sub(" ", text).strip()
+
+
+def extract_main(text, limit=2500):
+    """挑出正文主体段落（跳过导航短文本），截断到 limit 字符。"""
+    paras = [pp.strip() for pp in (text or "").split("\n")]
+    paras = [pp for pp in paras if len(pp) > 25]
+    return " ".join(paras)[:limit]
+
+
+def get_body(it):
+    """抓原文，失败或过短则退回 RSS 简介。"""
+    try:
+        t = extract_main(fetch_article(it["link"]))
+        if len(t) > 120:
+            return t
+    except Exception:
+        pass
+    return it.get("desc") or ""
+
+
 def process(groups, key):
-    """用 DeepSeek 统一处理所有条目：完整中文标题 + 一句话中心概述。失败则保留原文。"""
+    """抓原文 → DeepSeek 完整中文标题 + 150 字完整概述。失败保留原文。"""
     flat = []
     for g in groups:
         for it in g["items"]:
@@ -248,12 +272,17 @@ def process(groups, key):
     if not flat or not key:
         return 0, 0, None
 
-    payload = [{"title": it["title"], "desc": it.get("desc") or ""} for it in flat]
+    # 并行抓取原文正文
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        bodies = list(ex.map(get_body, flat))
+
+    payload = [{"title": it["title"], "body": bodies[i]} for i, it in enumerate(flat)]
     prompt = (
-        "你是一名新闻编辑。下面是 JSON 数组，每个对象是一条新闻的 {title, desc}。\n"
+        "你是一名资深新闻编辑。下面是 JSON 数组，每个对象是一条新闻的 {title, body}。\n"
         "对每条输出 {title, summary}：\n"
         "1) title 用完整简体中文标题：英文标题译成简体中文并保留完整意思；中文标题保留原文。\n"
-        "2) summary 用一句话简体中文概述该新闻的中心意思，表达清楚、不空洞，60 字以内。\n"
+        "2) summary 用简体中文写一段 150 字左右的完整概述，覆盖文章的核心事实、关键人物/数字与结论，信息具体、不空洞、不重复标题。\n"
+        "3) keywords 用 2-3 个简体中文关键词概括本条主题（字符串数组）。\n"
         "只输出 JSON 数组，不要任何解释或额外文字：\n"
         + json.dumps(payload, ensure_ascii=False)
     )
@@ -267,7 +296,7 @@ def process(groups, key):
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", "Bearer " + key)
     try:
-        with urllib.request.urlopen(req, timeout=120) as r:
+        with urllib.request.urlopen(req, timeout=180) as r:
             data = json.loads(r.read().decode("utf-8", "ignore"))
         content = data["choices"][0]["message"]["content"].strip()
         content = re.sub(r"^```(json)?\s*|\s*```$", "", content).strip()
@@ -277,6 +306,8 @@ def process(groups, key):
                 it["title"] = clean(tr["title"])
             if tr.get("summary"):
                 it["summary"] = clean(tr["summary"])
+            if tr.get("keywords"):
+                it["keywords"] = [clean(k) for k in tr["keywords"] if clean(k)]
         return len(flat), len(translated), None
     except urllib.error.HTTPError as e:
         try:
@@ -286,6 +317,91 @@ def process(groups, key):
         return len(flat), 0, "处理失败(HTTP %s): %s" % (e.code, detail)
     except Exception as e:
         return len(flat), 0, "处理失败: %s: %s" % (type(e).__name__, e)
+
+
+def _norm_scores(d):
+    return {
+        "downvote": {k: int(v) for k, v in d.get("downvote", {}).items()},
+        "blocked": [str(k) for k in d.get("blocked", [])],
+        "upvote": {k: int(v) for k, v in d.get("upvote", {}).items()},
+    }
+
+
+def load_scores():
+    """读取打分配置：优先 JSONBin（网页打分），否则回退 scores.json。"""
+    key = os.environ.get("JSONBIN_KEY", "").strip()
+    bin_id = os.environ.get("JSONBIN_BIN_ID", "").strip()
+    if key and bin_id:
+        try:
+            req = urllib.request.Request("https://api.jsonbin.io/v3/b/%s" % bin_id)
+            req.add_header("X-Master-Key", key)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                d = json.loads(r.read().decode("utf-8", "ignore")).get("record", {})
+            return _norm_scores(d)
+        except Exception:
+            pass
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scores.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return _norm_scores(d)
+    except Exception:
+        return {"downvote": {}, "blocked": [], "upvote": {}}
+
+
+def score_item(title, summary, scores):
+    """返回该条目的分数；命中拉黑或 3 次低分返回 None（丢弃）。"""
+    text = (title or "") + " " + (summary or "")
+    for kw in scores["blocked"]:
+        if kw and kw in text:
+            return None
+    s = 0
+    for kw, c in scores["upvote"].items():
+        if kw and kw in text:
+            s += c * 10
+    for kw, c in scores["downvote"].items():
+        if kw and kw in text:
+            if c >= 3:
+                return None
+            s -= c * 100
+    return s
+
+
+def apply_scores(groups, scores):
+    """打分过滤与排序：拉黑剔除、低分降权、高分优先，按源取满配额。"""
+    out = []
+    for group in groups:
+        by_source, order = {}, []
+        for it in group["items"]:
+            src = it["source"]
+            if src not in by_source:
+                by_source[src] = []
+                order.append(src)
+            by_source[src].append(it)
+        final = []
+        for src in order:
+            items = by_source[src]
+            scored = []
+            for it in items:
+                sc = score_item(it["title"], it["summary"], scores)
+                if sc is None:
+                    continue
+                scored.append((sc, it))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            maxn = items[0]["max"]
+            final.extend(it for _, it in scored[:maxn])
+        group["items"] = final[: group.get("limit", len(final))]
+        if group["items"]:
+            out.append(group)
+
+    total = sum(len(g["items"]) for g in out)
+    for group in reversed(out):
+        while total > MAX_ITEMS and group["items"]:
+            group["items"].pop()
+            total -= 1
+        if total <= MAX_ITEMS:
+            break
+    return [g for g in out if g["items"]]
 
 
 def build_markdown(groups, today, with_voice=True):
@@ -332,36 +448,92 @@ def synth(text, out_mp3):
 
 def build_site(groups, today, site_dir):
     os.makedirs(site_dir, exist_ok=True)
-    tts_text = build_tts_text(groups)
-    synth(tts_text, os.path.join(site_dir, "latest.mp3"))
+    synth(build_tts_text(groups), os.path.join(site_dir, "latest.mp3"))
 
-    body = []
+    jk = os.environ.get("JSONBIN_KEY", "").strip()
+    jb = os.environ.get("JSONBIN_BIN_ID", "").strip()
+
+    cards = []
     for g in groups:
-        body.append("<h2>%s</h2>" % html.escape(g["section"]))
+        cards.append('<h2>%s</h2>' % html.escape(g["section"]))
         last_source = None
         for it in g["items"]:
             if it["source"] != last_source:
-                body.append('<h3 class="src">%s</h3>' % html.escape(it["source"]))
+                cards.append('<h3 class="src">%s</h3>' % html.escape(it["source"]))
                 last_source = it["source"]
-            body.append(
-                '<p><a href="%s">%s</a> — %s</p>'
-                % (html.escape(it["link"]), html.escape(it["title"]), html.escape(it["summary"] or ""))
+            kws = [k for k in (it.get("keywords") or []) if k]
+            kws_json = html.escape(json.dumps(kws, ensure_ascii=False), quote=True)
+            chips = "".join('<span class="kw">#%s</span>' % html.escape(k) for k in kws)
+            cards.append(
+                '<div class="item" data-kws="%s">'
+                '<div class="t"><a href="%s" target="_blank" rel="noopener">%s</a></div>'
+                '<div class="s">%s</div>'
+                '<div class="kws">%s</div>'
+                '<div class="btns"><button class="up" title="喜欢，多推这类">👍 多推</button>'
+                '<button class="down" title="不喜欢，少推这类">👎 少推</button></div>'
+                '</div>'
+                % (kws_json, html.escape(it["link"]), html.escape(it["title"]),
+                   html.escape(it["summary"] or ""), chips)
             )
     page = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>每日简报 %(today)s</title>
 <style>
-body{font-family:-apple-system,system-ui,sans-serif;max-width:720px;margin:0 auto;padding:16px 20px 60px;color:#1a1a1a;line-height:1.7}
-h1{font-size:20px} h2{font-size:16px;border-bottom:1px solid #eee;padding-bottom:6px;margin-top:22px}
-h3.src{font-size:13px;color:#888;margin:12px 0 4px} p{font-size:14px;margin:6px 0}
-.audio{position:sticky;top:0;background:#fff;padding:10px 0;border-bottom:1px solid #eee}
-a{color:#0a66c2;text-decoration:none}
+body{font-family:-apple-system,system-ui,sans-serif;max-width:720px;margin:0 auto;padding:16px 20px 60px;color:#1a1a1a;line-height:1.7;background:#fafafa}
+h1{font-size:20px} h2{font-size:16px;border-bottom:1px solid #eee;padding-bottom:6px;margin-top:24px}
+h3.src{font-size:13px;color:#999;margin:14px 0 4px}
+.item{background:#fff;border-radius:10px;padding:12px 14px;margin:8px 0;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.t a{font-size:15px;font-weight:600;color:#111;text-decoration:none}
+.s{font-size:13px;color:#555;margin:6px 0}
+.kw{font-size:11px;color:#0a66c2;background:#eef4fc;border-radius:10px;padding:1px 8px;margin-right:4px;display:inline-block}
+.btns{margin-top:8px}
+.btns button{border:1px solid #ddd;background:#fff;border-radius:16px;padding:5px 14px;font-size:13px;margin-right:8px;cursor:pointer}
+.btns button:active{background:#f0f0f0}
+.audio{position:sticky;top:0;background:#fafafa;padding:8px 0;border-bottom:1px solid #eee}
 </style></head><body>
 <div class="audio"><audio controls autoplay src="latest.mp3" style="width:100%%"></audio></div>
-<h1>每日简报 %(today)s · AI 语音版</h1>
+<h1>每日简报 %(today)s · 可打分 · AI 语音</h1>
+<p style="font-size:13px;color:#888">点 👍 多推这类、👎 少推这类；同一关键词被 👎 3 次将不再推送。</p>
 %(body)s
-</body></html>""" % {"today": today, "body": "\n".join(body)}
+<script>
+var BIN = { key: "%(jk)s", id: "%(jb)s" };
+async function getRecord(){
+  var r = await fetch("https://api.jsonbin.io/v3/b/"+BIN.id, {headers:{"X-Master-Key":BIN.key}});
+  if(!r.ok) throw new Error("读取失败 "+r.status);
+  return ((await r.json()).record) || {};
+}
+async function putRecord(rec){
+  var r = await fetch("https://api.jsonbin.io/v3/b/"+BIN.id, {
+    method:"PUT", headers:{"X-Master-Key":BIN.key,"Content-Type":"application/json"},
+    body: JSON.stringify(rec)
+  });
+  if(!r.ok) throw new Error("写入失败 "+r.status);
+}
+async function vote(el, dir){
+  if(!BIN.key || !BIN.id){ alert("打分存储未配置，请先设置 JSONBin"); return; }
+  var kws; try { kws = JSON.parse(el.dataset.kws); } catch(e){ kws = []; }
+  if(!kws.length){ alert("本条无关键词，无法打分"); return; }
+  var btn = el.querySelector("."+dir);
+  var old = btn.textContent;
+  btn.disabled = true; btn.textContent = "…";
+  try {
+    var rec = await getRecord();
+    rec[dir] = rec[dir] || {};
+    for(var i=0;i<kws.length;i++){ rec[dir][kws[i]] = (rec[dir][kws[i]]||0) + 1; }
+    await putRecord(rec);
+    btn.textContent = old + " ✓";
+  } catch(e){
+    btn.disabled = false; btn.textContent = old;
+    alert("打分失败：" + e.message);
+  }
+}
+document.querySelectorAll(".item").forEach(function(item){
+  item.querySelector(".up").addEventListener("click", function(){ vote(item,"up"); });
+  item.querySelector(".down").addEventListener("click", function(){ vote(item,"down"); });
+});
+</script>
+</body></html>""" % {"today": today, "body": "\n".join(cards), "jk": jk, "jb": jb}
     with open(os.path.join(site_dir, "index.html"), "w", encoding="utf-8") as f:
         f.write(page)
 
@@ -417,6 +589,9 @@ def main():
             print("[info] 翻译并概述 %d 条" % n_done, file=sys.stderr)
     else:
         print("[warn] 未设置 DEEPSEEK_API_KEY，跳过处理，保留原文标题与摘要", file=sys.stderr)
+
+    # 打分过滤：拉黑剔除、低分降权、高分优先
+    groups = apply_scores(groups, load_scores())
 
     markdown = build_markdown(groups, today, with_voice=bool(args.site))
     print(markdown)
